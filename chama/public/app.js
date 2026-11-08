@@ -58,7 +58,7 @@ window.logout = logout;
 
 async function render() {
   const app = $('#app');
-  if (!token) return (app.innerHTML = loginView());
+  if (!token) return (app.innerHTML = await loginView());
   try {
     if (!me) me = await api('GET', '/auth/me');
     const fn = views[view] || views.home;
@@ -68,17 +68,39 @@ async function render() {
   } catch (e) { if (token) { app.innerHTML = shell(`<div class="glass">${esc(e.message)}</div>`); } }
 }
 
-function loginView() {
-  return `<form class="glass login" id="login"><div class="brand" style="margin-bottom:14px"><div class="logo">₵</div><div><h1>Cash Round</h1><div class="mute small">Rotation savings group</div></div></div>
-  <label for="lid">Email, phone or member code</label><input id="lid" autocomplete="username" required>
-  <label for="lpw">Password</label><input id="lpw" type="password" autocomplete="current-password" required>
-  <div class="actions"><button class="btn pri" style="width:100%">Sign in</button></div></form>`;
+async function loginView() {
+  let needed = false; try { needed = (await api('GET', '/setup/status')).needed; } catch { /* server unreachable: show login */ }
+  const brand = '<div class="brand" style="margin-bottom:14px"><div class="logo">₵</div><div><h1>Cash Round</h1><div class="mute small">Rotation savings group</div></div></div>';
+  if (needed) return `<div class="glass login" id="setup">${brand}<h2>Set up your group</h2><p class="small mute">Create the treasurer account. You can add members afterwards.</p>
+  <label for="sg">Group name</label><input id="sg" placeholder="e.g. BTI Cash Round Group">
+  <label for="sa">Monthly contribution per member (UGX)</label><input id="sa" type="number" min="1" value="50000">
+  <label for="sn">Your full name</label><input id="sn" autocomplete="name">
+  <label for="se">Your email</label><input id="se" type="email" autocomplete="email">
+  <label for="sp">Your phone</label><input id="sp" inputmode="tel" autocomplete="tel">
+  <label for="sw">Password (min 8 characters)</label><input id="sw" type="password" autocomplete="new-password">
+  <div class="actions"><button type="button" class="btn pri" style="width:100%" onclick="doSetup()">Create group</button></div></div>`;
+  return `<div class="glass login" id="login">${brand}
+  <label for="lid">Email, phone or member code</label><input id="lid" autocomplete="username">
+  <label for="lpw">Password</label><input id="lpw" type="password" autocomplete="current-password">
+  <div class="actions"><button type="button" class="btn pri" style="width:100%" onclick="doLogin()">Sign in</button></div></div>`;
 }
-document.addEventListener('submit', async e => {
-  if (e.target.getAttribute('id') !== 'login') return;
-  e.preventDefault();
+// Buttons and Enter-key handling instead of <form> submits: sandboxed viewers block native form submission.
+window.doLogin = async () => {
   const r = await act(() => api('POST', '/auth/login', { identifier: $('#lid').value, password: $('#lpw').value }));
   if (r) { token = r.token; safe.set('token', token); me = r.user; view = 'home'; syncQueue(); render(); }
+};
+window.doSetup = async () => {
+  const v = id => $('#' + id).value;
+  const r = await act(() => api('POST', '/setup', { group_name: v('sg'), contribution_amount: v('sa'), name: v('sn'), email: v('se'), phone: v('sp'), password: v('sw') }));
+  if (!r) return;
+  const l = await act(() => api('POST', '/auth/login', { identifier: v('se') || v('sp'), password: v('sw') }));
+  if (l) { token = l.token; safe.set('token', token); me = l.user; view = 'home'; render(); toast('Group created. Add your members next.'); }
+};
+document.addEventListener('keydown', e => {
+  if (e.key !== 'Enter' || !e.target.closest) return;
+  if (e.target.closest('#login')) { e.preventDefault(); window.doLogin(); }
+  else if (e.target.closest('#setup')) { e.preventDefault(); window.doSetup(); }
+  else if (e.target.closest('form')) e.preventDefault();
 });
 
 const chip = (s) => `<span class="chip ${({ paid: 'ok', settled: 'ok', active: 'ok', closed: 'acc', late: 'bad', pending: 'warn', drawn: 'warn', draft: 'warn', inactive: 'bad' })[s] || ''}">${esc(s)}</span>`;
@@ -188,7 +210,7 @@ views.cycle = async () => {
     }
   } else {
     h += `<div class="glass"><h2>No open cycle</h2><p class="mute">Cycle ${Math.max(...cycles.map(c => c.cycle_number), 0) + 1} will use all active members and the current contribution amount.</p>
-      <form id="fn" class="frm"><div><label>Start month</label><input name="start_month" type="month"></div></form>
+      <form id="fn" class="frm"><div><label>Start month</label><input name="start_month" type="month"></div>${cycles.length ? '' : '<div><label>Cycle number (if continuing an earlier cycle)</label><input name="cycle_number" type="number" min="1" value="1"></div>'}</form>
       <div class="actions"><button class="btn pri" onclick="newCycle()">Create next cycle</button></div></div>`;
   }
   h += `<div class="glass"><h2>All cycles</h2>${cycles.map(c => `<div class="row"><div class="grow"><b>Cycle ${c.cycle_number}</b><div class="small mute">${esc(c.start_label)} – ${esc(c.end_label)} · ${c.group_size} members · ${money(c.amount)} each</div></div>${chip(c.status)}</div>`).join('')}</div>`;
@@ -197,7 +219,7 @@ views.cycle = async () => {
 window.runDraw = async id => { if (await act(() => api('POST', `/cycles/${id}/draw`), 'Draw generated – review before confirming')) render(); };
 window.confirmDraw = async id => { if (!confirm('Lock the draw and notify all members? This cannot be redrawn afterwards.')) return; if (await act(() => api('POST', `/cycles/${id}/draw/confirm`), 'Draw locked and members notified')) render(); };
 window.closeCycle = async id => { if (!confirm('Close and archive this cycle?')) return; if (await act(() => api('POST', `/cycles/${id}/close`), 'Cycle closed and archived')) render(); };
-window.newCycle = async () => { const f = Object.fromEntries(new FormData($('#fn'))); if (await act(() => api('POST', '/cycles', f.start_month ? f : {}), 'Cycle created')) render(); };
+window.newCycle = async () => { const f = Object.fromEntries(new FormData($('#fn'))); const body = {}; if (f.start_month) body.start_month = f.start_month; if (f.cycle_number) body.cycle_number = Number(f.cycle_number); if (await act(() => api('POST', '/cycles', body), 'Cycle created')) render(); };
 window.override = async id => { const f = Object.fromEntries(new FormData($('#fo'))); if (await act(() => api('POST', `/cycles/${id}/draw/override`, f), 'Override applied and logged')) render(); };
 
 views.members = async () => {
