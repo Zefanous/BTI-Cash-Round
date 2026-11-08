@@ -41,4 +41,13 @@ async function notifier({ channel, to, message }) {
   const app = createApp(store, { secret, notifier });
   const port = process.env.PORT || 3000;
   app.listen(port, () => console.log(`Chama running on http://localhost:${port}`));
-})().catch(e => { console.error(e); process.exit(1); });
+})().catch(e => {
+  const g = e && e.response && e.response.data && e.response.data.error;
+  const code = (g && g.code) || e.code, msg = (g && g.message) || e.message;
+  console.error('STARTUP FAILED:', code, msg);
+  if (code === 403 || /permission/i.test(msg)) console.error('HINT: share the Google Sheet with the service account email as Editor, and enable the Google Sheets API for the project.');
+  else if (code === 404 || /not found/i.test(msg)) console.error('HINT: SHEET_ID is wrong. Use only the part between /d/ and /edit in the sheet address.');
+  else if (/JSON|private_key|invalid_grant|client_email/i.test(msg)) console.error('HINT: GOOGLE_SERVICE_ACCOUNT_JSON must be the full contents of the downloaded key file, starting with { and ending with }.');
+  else if (/googleapis/i.test(msg)) console.error('HINT: run npm install googleapis (it should install automatically).');
+  process.exit(1);
+});
