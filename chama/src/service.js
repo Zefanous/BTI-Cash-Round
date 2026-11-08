@@ -54,6 +54,25 @@ class Service {
     });
   }
 
+  // ================= first-run setup =================
+  needsSetup() { return this.s.count('Members') === 0; }
+  setup(d) {
+    if (!this.needsSetup()) throw new ConflictError('Setup is already complete');
+    const pw = String(d.password || '');
+    if (pw.length < 8) throw bad('Password must be at least 8 characters');
+    if (!String(d.group_name || '').trim()) throw bad('Group name is required');
+    const amount = Number(d.contribution_amount);
+    if (!(amount > 0)) throw bad('Contribution amount must be greater than 0');
+    return this.s.transaction(() => {
+      const m = this.createMember({ name: d.name, email: d.email, phone: d.phone, role: 'admin', password: pw }, null);
+      for (const [k, v] of Object.entries({ group_name: String(d.group_name).trim(), contribution_amount: String(amount), currency: String(d.currency || 'UGX').trim() })) {
+        this.s.update('Config', this.s.one('Config', r => r.key === k).id, { value: v });
+      }
+      this.audit({ id: m.id }, 'system.setup', 'Config', 0, `Group "${d.group_name}" created`, null, { group_name: d.group_name, contribution_amount: amount });
+      return m;
+    });
+  }
+
   // ================= audit (hash-chained, tamper-evident) =================
   audit(actor, action, entity, entityId, summary, before, after) {
     const last = this.s.all('AuditLogs').pop();
@@ -157,7 +176,8 @@ class Service {
     return this.s.transaction(() => {
       if (this.s.one('Cycles', c => c.status !== 'closed')) throw new ConflictError('Close the running cycle before creating a new one');
       const all = this.s.all('Cycles');
-      const num = all.reduce((m, c) => Math.max(m, c.cycle_number), 0) + 1;
+      let num = all.reduce((m, c) => Math.max(m, c.cycle_number), 0) + 1;
+      if (!all.length && Number.isInteger(Number(d.cycle_number)) && Number(d.cycle_number) >= 1) num = Number(d.cycle_number); // existing group continuing from an earlier cycle
       const last = all.sort((a, b) => b.cycle_number - a.cycle_number)[0];
       const start = d.start_month || (last ? addMonths(last.end_month, 1) : today().slice(0, 7));
       if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(start)) throw bad('start_month must be YYYY-MM');

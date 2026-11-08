@@ -42,6 +42,8 @@ function createApp(store, { secret = process.env.JWT_SECRET, notifier, loginLimi
     attempts.delete(id);
     res.json({ token: sign({ sub: u.id, role: u.role }, secret), user: svc.publicMember(u, true) });
   }));
+  app.get('/api/setup/status', wrap((req, res) => res.json({ needed: svc.needsSetup() })));
+  app.post('/api/setup', wrap((req, res) => res.status(201).json(svc.setup(req.body || {}))));
   app.get('/api/auth/me', auth(), wrap((req, res) => res.json(svc.publicMember(req.user, true))));
   app.post('/api/auth/change-password', auth(), wrap((req, res) => {
     const { current, next } = req.body;
