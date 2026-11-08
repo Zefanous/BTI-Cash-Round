@@ -24,7 +24,7 @@ async function download(path, name) {
 }
 const act = async (fn, ok) => { try { const r = await fn(); if (ok) toast(ok); return r; } catch (e) { toast(e.message, true); } };
 
-function logout(silent) { token = null; me = null; safe.del('token'); render(); if (!silent) toast('Signed out'); }
+function logout(silent) { token = null; me = null; safe.del('token'); safe.del('me'); render(); if (!silent) toast('Signed out'); }
 
 // ---------- offline queue for contributions ----------
 const queue = () => { try { return JSON.parse(safe.get('queue') || '[]'); } catch { return []; } };
@@ -49,28 +49,33 @@ function tabs() {
   return t;
 }
 function shell(inner) {
-  return `<div class="top"><div class="brand"><div class="logo">₵</div><div><h1>${esc(cache.group || 'Cash Round')}</h1><div class="mute small">${esc(me.name)} · ${esc(me.role)}</div></div></div>
+  return `<div class="top"><div class="brand"><div class="logo"><img src="badge.png" alt="BTI badge"></div><div><h1>${esc(cache.group || 'Cash Round')}</h1><div class="mute small">${esc(me.name)} · ${esc(me.role)}</div></div></div>
   <button class="btn" onclick="logout()">Sign out</button></div>
+  <div class="glass install" id="inst"><div class="grow"><b>Install this app</b><div class="small mute" id="inst-t"></div></div><button class="btn pri" id="inst-b" onclick="installApp()">Install</button><button class="btn" onclick="hideInstall()">Not now</button></div>
   <nav class="nav">${tabs().map(([k, l]) => `<button class="${view === k ? 'on' : ''}" onclick="go('${k}')">${l}</button>`).join('')}</nav>${inner}`;
 }
 window.go = v => { view = v; render(); window.scrollTo(0, 0); };
 window.logout = logout;
 
+window.render = render;
 async function render() {
   const app = $('#app');
   if (!token) return (app.innerHTML = await loginView());
   try {
-    if (!me) me = await api('GET', '/auth/me');
+    if (!me) {
+      try { me = await api('GET', '/auth/me'); safe.set('me', JSON.stringify(me)); }
+      catch (e) { try { me = JSON.parse(safe.get('me') || 'null'); } catch { me = null; } if (!me) throw e; } // offline: reuse the last known profile
+    }
     const fn = views[view] || views.home;
     app.innerHTML = shell('<div class="glass mute">Loading…</div>');
     app.innerHTML = shell(await fn());
     bind();
-  } catch (e) { if (token) { app.innerHTML = shell(`<div class="glass">${esc(e.message)}</div>`); } }
+  } catch (e) { if (token) { const off = /Failed to fetch|NetworkError|Load failed/i.test(e.message); app.innerHTML = me ? shell(`<div class="glass"><h2>${off ? 'You are offline' : 'Something went wrong'}</h2><p class="mute">${off ? 'Contributions you record in the Record tab are saved on this device and sent when you are back online.' : esc(e.message)}</p><div class="actions"><button class="btn" onclick="render()">Try again</button></div></div>`) : `<div class="glass login">${esc(e.message)}</div>`; } }
 }
 
 async function loginView() {
   let needed = false; try { needed = (await api('GET', '/setup/status')).needed; } catch { /* server unreachable: show login */ }
-  const brand = '<div class="brand" style="margin-bottom:14px"><div class="logo">₵</div><div><h1>Cash Round</h1><div class="mute small">Rotation savings group</div></div></div>';
+  const brand = '<div class="brand" style="margin-bottom:14px"><div class="logo"><img src="badge.png" alt="BTI badge"></div><div><h1>Cash Round</h1><div class="mute small">Rotation savings group</div></div></div>';
   if (needed) return `<div class="glass login" id="setup">${brand}<h2>Set up your group</h2><p class="small mute">Create the treasurer account. You can add members afterwards.</p>
   <label for="sg">Group name</label><input id="sg" placeholder="e.g. BTI Cash Round Group">
   <label for="sa">Monthly contribution per member (UGX)</label><input id="sa" type="number" min="1" value="50000">
@@ -268,6 +273,21 @@ views.audit = async () => {
   ${log.map(l => `<tr><td>${l.id}</td><td>${esc(l.timestamp.replace('T', ' ').slice(0, 16))}</td><td>${l.actor_id}</td><td>${esc(l.action)}</td><td>${esc(l.summary)}</td></tr>`).join('')}</table></div></div>`;
 };
 
-function bind() { /* inline handlers are used; nothing else to bind */ }
+function bind() { updateInstall(); }
+
+// ---------- install as a phone app (PWA) ----------
+let deferredPrompt = null;
+const standalone = () => window.matchMedia('(display-mode: standalone)').matches || navigator.standalone;
+const isIOS = () => /iphone|ipad|ipod/i.test(navigator.userAgent);
+function updateInstall() {
+  const el = $('#inst'); if (!el || standalone() || safe.get('hideInstall')) return;
+  if (deferredPrompt) { $('#inst-t').textContent = 'Add Cash Round to your home screen for one-tap access.'; el.classList.add('show'); }
+  else if (isIOS()) { $('#inst-t').textContent = 'On iPhone: tap the Share button, then "Add to Home Screen".'; $('#inst-b').style.display = 'none'; el.classList.add('show'); }
+}
+window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); deferredPrompt = e; updateInstall(); });
+window.addEventListener('appinstalled', () => { deferredPrompt = null; const el = $('#inst'); if (el) el.classList.remove('show'); toast('App installed'); });
+window.installApp = async () => { if (!deferredPrompt) return; deferredPrompt.prompt(); await deferredPrompt.userChoice; deferredPrompt = null; const el = $('#inst'); if (el) el.classList.remove('show'); };
+window.hideInstall = () => { safe.set('hideInstall', '1'); const el = $('#inst'); if (el) el.classList.remove('show'); };
+if ('serviceWorker' in navigator) window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js').catch(() => { /* offline shell is optional */ }));
 render();
 if (token) syncQueue();
