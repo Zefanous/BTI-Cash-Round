@@ -10,8 +10,23 @@ const uid = () => (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) 
 
 function toast(msg, err) { const t = $('#toast'); t.textContent = msg; t.className = 'show' + (err ? ' err' : ''); clearTimeout(toast.t); toast.t = setTimeout(() => { t.className = ''; }, 3500); }
 
+const NET_ERR = /Failed to fetch|NetworkError|Load failed|network error|aborted/i;
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+// Reads and login are safe to retry: a sleeping free-tier server often drops the first request from a phone.
 async function api(method, path, body, extraHeaders) {
-  const res = await fetch('/api' + path, { method, headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: 'Bearer ' + token } : {}), ...extraHeaders }, body: body ? JSON.stringify(body) : undefined });
+  const retryable = method === 'GET' || path === '/auth/login' || path === '/setup/status';
+  let res, lastErr;
+  for (let attempt = 0; attempt < (retryable ? 4 : 1); attempt++) {
+    try {
+      const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), 30000);
+      res = await fetch('/api' + path, { method, signal: ctl.signal, headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: 'Bearer ' + token } : {}), ...extraHeaders }, body: body ? JSON.stringify(body) : undefined });
+      clearTimeout(t); lastErr = null; break;
+    } catch (e) {
+      lastErr = e;
+      if (retryable && attempt < 3) { toast('Server is waking up, retrying…'); await sleep(2500 * (attempt + 1)); }
+    }
+  }
+  if (lastErr) throw new Error(navigator.onLine === false ? 'Failed to fetch' : 'Failed to fetch: cannot reach the server. Check your internet and try again in a minute.');
   let data = null; try { data = await res.json(); } catch { /* non-json */ }
   if (res.status === 401 && token) { logout(true); throw new Error('Session expired'); }
   if (!res.ok) throw new Error((data && data.error) || 'Request failed');
