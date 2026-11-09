@@ -42,5 +42,5 @@ table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:8px 6px;t
 @media(prefers-reduced-motion:reduce){*{transition:none!important}}
 .row .grow,.glass{overflow-wrap:anywhere}
 
-body::before{content:"";position:fixed;inset:0;z-index:0;pointer-events:none;background:url(bg-badge.png) center 45%/min(110vmin,760px) no-repeat;opacity:.24}
+body::before{content:"";position:fixed;inset:0;z-index:0;pointer-events:none;background:url(bg-badge.webp) center 45%/min(110vmin,760px) no-repeat;opacity:.24}
 .install{display:none;margin-bottom:14px}.install.show{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.install .grow{flex:1;min-width:180px}

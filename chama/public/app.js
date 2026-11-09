@@ -5,11 +5,16 @@ const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': 
 const money = n => Number(n || 0).toLocaleString('en-UG');
 const safe = { get(k) { try { return localStorage.getItem(k); } catch { return null; } }, set(k, v) { try { localStorage.setItem(k, v); } catch { /* ignore */ } }, del(k) { try { localStorage.removeItem(k); } catch { /* ignore */ } } };
 
-let token = safe.get('token'), me = null, view = 'home', cache = {};
+let token = safe.get('token'), me = (() => { try { return JSON.parse(safe.get('me') || 'null'); } catch { return null; } })(), view = 'home', cache = {};
 const uid = () => (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random());
 
 function toast(msg, err) { const t = $('#toast'); t.textContent = msg; t.className = 'show' + (err ? ' err' : ''); clearTimeout(toast.t); toast.t = setTimeout(() => { t.className = ''; }, 3500); }
 
+// Last successful GET responses are kept on the phone (per signed-in user) so screens still open without data.
+let staleAt = 0;
+const savedKey = p => 'saved:' + (me ? me.id : 'x') + ':' + p;
+const readSaved = p => { try { return JSON.parse(safe.get(savedKey(p)) || 'null'); } catch { return null; } };
+const writeSaved = (p, d) => { if (p.startsWith('/reports')) return; safe.set(savedKey(p), JSON.stringify({ t: Date.now(), data: d })); };
 const NET_ERR = /Failed to fetch|NetworkError|Load failed|network error|aborted/i;
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 // Reads and login are safe to retry: a sleeping free-tier server often drops the first request from a phone.
@@ -23,11 +28,16 @@ async function api(method, path, body, extraHeaders) {
       clearTimeout(t); lastErr = null; break;
     } catch (e) {
       lastErr = e;
-      if (retryable && attempt < 3) { toast('Server is waking up, retrying…'); await sleep(2500 * (attempt + 1)); }
+      if (retryable && attempt < 3 && navigator.onLine !== false) { toast('Server is waking up, retrying…'); await sleep(2500 * (attempt + 1)); }
     }
+  }
+  if (lastErr) {
+    const saved = method === 'GET' ? readSaved(path) : null;
+    if (saved) { staleAt = Math.min(staleAt || Infinity, saved.t); return saved.data; } // show what was last seen instead of failing
   }
   if (lastErr) throw new Error(navigator.onLine === false ? 'Failed to fetch' : 'Failed to fetch: cannot reach the server. Check your internet and try again in a minute.');
   let data = null; try { data = await res.json(); } catch { /* non-json */ }
+  if (res.ok && method === 'GET' && data !== null) writeSaved(path, data);
   if (res.status === 401 && token) { logout(true); throw new Error('Session expired'); }
   if (!res.ok) throw new Error((data && data.error) || 'Request failed');
   return data;
@@ -39,7 +49,7 @@ async function download(path, name) {
 }
 const act = async (fn, ok) => { try { const r = await fn(); if (ok) toast(ok); return r; } catch (e) { toast(e.message, true); } };
 
-function logout(silent) { token = null; me = null; safe.del('token'); safe.del('me'); render(); if (!silent) toast('Signed out'); }
+function logout(silent) { token = null; me = null; safe.del('token'); safe.del('me'); try { Object.keys(localStorage).filter(k => k.startsWith('saved:')).forEach(k => localStorage.removeItem(k)); } catch { /* ignore */ } render(); if (!silent) toast('Signed out'); }
 
 // ---------- offline queue for contributions ----------
 const queue = () => { try { return JSON.parse(safe.get('queue') || '[]'); } catch { return []; } };
@@ -51,7 +61,7 @@ async function syncQueue() {
   saveQueue(left);
   if (left.length < q.length) { toast(`Synced ${q.length - left.length} offline entr${q.length - left.length > 1 ? 'ies' : 'y'}`); if (view === 'record') render(); }
 }
-window.addEventListener('online', syncQueue);
+window.addEventListener('online', () => { syncQueue(); if (token && me) render(); });
 
 // ---------- shell ----------
 const isStaff = () => me && me.role !== 'member';
@@ -83,7 +93,10 @@ async function render() {
     }
     const fn = views[view] || views.home;
     app.innerHTML = shell('<div class="glass mute">Loading…</div>');
-    app.innerHTML = shell(await fn());
+    staleAt = 0;
+    const inner = await fn();
+    const banner = staleAt ? `<div class="glass" style="border-color:var(--warn)"><b>No internet connection</b><div class="small mute">Showing information saved on this phone at ${esc(new Date(staleAt).toLocaleString())}. It refreshes automatically when you are back online.</div><div class="actions"><button class="btn" onclick="render()">Try again</button></div></div>` : '';
+    app.innerHTML = shell(banner + inner);
     bind();
   } catch (e) { if (token) { const off = /Failed to fetch|NetworkError|Load failed/i.test(e.message); app.innerHTML = me ? shell(`<div class="glass"><h2>${off ? 'You are offline' : 'Something went wrong'}</h2><p class="mute">${off ? 'Contributions you record in the Record tab are saved on this device and sent when you are back online.' : esc(e.message)}</p><div class="actions"><button class="btn" onclick="render()">Try again</button></div></div>`) : `<div class="glass login">${esc(e.message)}</div>`; } }
 }
@@ -107,14 +120,14 @@ async function loginView() {
 // Buttons and Enter-key handling instead of <form> submits: sandboxed viewers block native form submission.
 window.doLogin = async () => {
   const r = await act(() => api('POST', '/auth/login', { identifier: $('#lid').value, password: $('#lpw').value }));
-  if (r) { token = r.token; safe.set('token', token); me = r.user; view = 'home'; syncQueue(); render(); }
+  if (r) { token = r.token; safe.set('token', token); me = r.user; safe.set('me', JSON.stringify(me)); view = 'home'; syncQueue(); render(); }
 };
 window.doSetup = async () => {
   const v = id => $('#' + id).value;
   const r = await act(() => api('POST', '/setup', { group_name: v('sg'), contribution_amount: v('sa'), name: v('sn'), email: v('se'), phone: v('sp'), password: v('sw') }));
   if (!r) return;
   const l = await act(() => api('POST', '/auth/login', { identifier: v('se') || v('sp'), password: v('sw') }));
-  if (l) { token = l.token; safe.set('token', token); me = l.user; view = 'home'; render(); toast('Group created. Add your members next.'); }
+  if (l) { token = l.token; safe.set('token', token); me = l.user; safe.set('me', JSON.stringify(me)); view = 'home'; render(); toast('Group created. Add your members next.'); }
 };
 document.addEventListener('keydown', e => {
   if (e.key !== 'Enter' || !e.target.closest) return;

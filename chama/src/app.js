@@ -1,5 +1,6 @@
 'use strict';
 const express = require('express');
+const compression = require('compression');
 const path = require('path');
 const PDFDocument = require('pdfkit');
 const { Service, HttpError, verifyPassword } = require('./service');
@@ -11,9 +12,10 @@ function createApp(store, { secret = process.env.JWT_SECRET, notifier, loginLimi
   const svc = new Service(store, { notifier });
   const app = express();
   app.disable('x-powered-by');
+  app.use(compression()); // gzip: roughly 70% less data for the page, scripts and JSON
   app.use(express.json({ limit: '100kb' }));
   app.use((req, res, next) => {
-    res.set({ 'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY', 'Referrer-Policy': 'no-referrer', 'Cache-Control': req.path.startsWith('/api') ? 'no-store' : 'no-cache' });
+    res.set({ 'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY', 'Referrer-Policy': 'no-referrer', 'Cache-Control': req.path.startsWith('/api') ? 'no-store' : /\.(png|webp|ico)$/.test(req.path) ? 'public, max-age=604800' : 'no-cache' });
     next();
   });
 
