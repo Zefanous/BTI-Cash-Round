@@ -334,3 +334,75 @@ test('input hardening: malformed JSON, unknown routes, unknown config keys, stat
   assert.equal((await e.api('GET', '/api/cycles/999', { token: e.admin })).status, 404);
   await e.close();
 });
+
+test('first-run setup: empty system, create treasurer once, then locked; first cycle can continue numbering', async () => {
+  const { Store } = require('../src/store'); const { MemoryBackend } = require('../src/backends'); const { createApp } = require('../src/app');
+  const store = new Store(new MemoryBackend()); const app = createApp(store, { secret: 's' });
+  const server = await new Promise(r => { const x = app.listen(0, () => r(x)); }); const base = `http://127.0.0.1:${server.address().port}`;
+  const call = async (m, p, body, tok) => { const r = await fetch(base + p, { method: m, headers: { 'Content-Type': 'application/json', ...(tok ? { Authorization: 'Bearer ' + tok } : {}) }, body: body ? JSON.stringify(body) : undefined }); return { status: r.status, data: await r.json().catch(() => null) }; };
+  assert.equal((await call('GET', '/api/setup/status')).data.needed, true);
+  assert.equal((await call('POST', '/api/setup', { group_name: 'G', contribution_amount: 50000, name: 'Treasurer', email: 't@x.com', password: 'short' })).status, 400);
+  assert.equal((await call('POST', '/api/setup', { group_name: 'BTI Group', contribution_amount: 50000, name: 'Treasurer', email: 't@x.com', password: 'longenough1' })).status, 201);
+  assert.equal((await call('GET', '/api/setup/status')).data.needed, false);
+  assert.equal((await call('POST', '/api/setup', { group_name: 'Hack', contribution_amount: 1, name: 'Evil', email: 'e@x.com', password: 'longenough1' })).status, 409, 'cannot re-run setup');
+  const tok = (await call('POST', '/api/auth/login', { identifier: 't@x.com', password: 'longenough1' })).data.token;
+  assert.equal(store.count('Members'), 1); assert.equal(store.count('Contributions'), 0); assert.equal(store.count('Cycles'), 0);
+  for (let i = 2; i <= 4; i++) assert.equal((await call('POST', '/api/members', { name: 'Member ' + i, phone: '07000000' + i, password: 'longenough1' }, tok)).status, 201);
+  const c = await call('POST', '/api/cycles', { cycle_number: 2, start_month: '2026-12' }, tok);
+  assert.equal(c.data.cycle_number, 2);
+  const d = await call('POST', `/api/cycles/${c.data.id}/draw`, {}, tok); assert.equal(d.data.results.length, 4);
+  assert.equal((await call('GET', '/api/config', null, tok)).data.group_name, 'BTI Group');
+  server.closeAllConnections(); server.close();
+});
+
+test('manual order: validation, audit note, 1st-of-month start, order-only cycle, verification', async () => {
+  const e = await boot();
+  const cid = 2; // seeded draft Cycle 2 (10 participants)
+  const post = (p, b, t) => e.api('POST', p, { token: t || e.admin, body: b });
+  const good = [4, 9, 2, 7, 1, 10, 5, 3, 8, 6].map((m, i) => ({ member_id: m, position: i + 1 }));
+  const url = `/api/cycles/${cid}/draw/manual`;
+  assert.equal((await post(url, { assignments: good }, await e.tokenFor(2))).status, 403, 'members cannot');
+  assert.equal((await post(url, { assignments: good })).status, 400, 'note required');
+  const dup = good.map(a => ({ ...a })); dup[1].position = 1;
+  const r1 = await post(url, { assignments: dup, note: 'Group vote 9 Nov' }); assert.equal(r1.status, 400); assert.match(r1.data.error, /Number 1 is given to both/);
+  const miss = await post(url, { assignments: good.slice(0, 9), note: 'Group vote 9 Nov' }); assert.equal(miss.status, 400); assert.match(miss.data.error, /No number entered for/);
+  assert.equal((await post(url, { assignments: good.map((a, i) => i === 0 ? { ...a, position: 11 } : a), note: 'Group vote 9 Nov' })).status, 400, 'out of range');
+  assert.equal((await post(url, { assignments: [...good.slice(0, 9), { member_id: 11, position: 10 }], note: 'Group vote 9 Nov' })).status, 400, 'non-participant');
+  const ok = await post(url, { assignments: good, note: 'Group vote held 10 Nov 2026 morning', start_month: '2026-11', mode: 'order_only' });
+  assert.equal(ok.status, 200);
+  assert.deepEqual(ok.data.results.map(r => r.member_id), [4, 9, 2, 7, 1, 10, 5, 3, 8, 6]);
+  assert.equal(ok.data.results[0].payout_month, 'November 2026'); assert.equal(ok.data.results[9].payout_month, 'August 2027');
+  assert.equal(ok.data.cycle.start_month, '2026-11'); assert.equal(ok.data.cycle.end_month, '2027-08');
+  // hidden from members until confirmed
+  assert.equal((await e.api('GET', `/api/cycles/${cid}`, { token: await e.tokenFor(4) })).data.results.length, 0);
+  assert.equal((await post(`/api/cycles/${cid}/draw/confirm`, {})).status, 200);
+  await e.settle();
+  assert.equal(e.store.all('Notifications').filter(n => n.type === 'draw_published').length, 10);
+  const audit = (await e.api('GET', '/api/audit', { token: e.admin })).data.find(a => a.action === 'draw.manual');
+  assert.match(audit.summary, /Group vote held 10 Nov/); assert.equal(audit.after.assignments.length, 10);
+  const v = (await e.api('GET', `/api/cycles/${cid}/draw/verify`, { token: e.admin })).data; assert.equal(v.valid, true); assert.equal(v.method, 'manual');
+  // order-only: money is not tracked this cycle
+  assert.equal((await post('/api/contributions', { cycle_id: cid, member_id: 2 })).status, 409);
+  assert.equal((await post('/api/payouts', { cycle_id: cid })).status, 409);
+  const d = (await e.api('GET', '/api/dashboard', { token: await e.tokenFor(4) })).data;
+  assert.equal(d.my.position, 1); assert.equal(d.my.payout_month, 'November 2026');
+  assert.equal(d.current_month.order_only, true); assert.equal(d.current_month.recipient.member_id, 4);
+  assert.equal(d.order.length, 10); assert.equal(d.order.filter(o => o.is_current).length, 1);
+  assert.equal((await post(`/api/cycles/${cid}/draw/manual`, { assignments: good, note: 'again please' })).status, 409, 'locked');
+  assert.equal((await post(`/api/cycles/${cid}/close`, {})).status, 200, 'order-only cycle closes without payouts');
+  assert.equal((await post('/api/cycles', {})).status, 201, 'next cycle can start');
+  await e.close();
+});
+
+test('manual order with full tracking, and start month change before locking', async () => {
+  const e = await boot();
+  const good = Array.from({ length: 10 }, (_, i) => ({ member_id: i + 1, position: 10 - i }));
+  assert.equal((await e.api('PUT', '/api/cycles/2', { token: e.admin, body: { start_month: '2026-13' } })).status, 400);
+  assert.equal((await e.api('PUT', '/api/cycles/2', { token: e.admin, body: { start_month: '2026-11' } })).data.start_month, '2026-11');
+  const r = await e.api('POST', '/api/cycles/2/draw/manual', { token: e.admin, body: { assignments: good, note: 'Vote held on paper', mode: 'full' } });
+  assert.equal(r.status, 200);
+  await e.api('POST', '/api/cycles/2/draw/confirm', { token: e.admin });
+  assert.equal((await e.api('POST', '/api/contributions', { token: e.admin, body: { cycle_id: 2, member_id: 1 } })).status, 201, 'full mode records money');
+  assert.equal((await e.api('PUT', '/api/cycles/2', { token: e.admin, body: { start_month: '2026-12' } })).status, 409, 'locked');
+  await e.close();
+});

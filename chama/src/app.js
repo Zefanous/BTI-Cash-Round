@@ -82,6 +82,8 @@ function createApp(store, { secret = process.env.JWT_SECRET, notifier, loginLimi
     res.json({ cycle: svc.publicCycle(c), results: revealed || (staff && c.status === 'drawn') ? svc.drawResults(c.id) : [], locked: revealed, commitment: c.draw_hash });
   }));
   app.post('/api/cycles/:id/draw', auth(ADMIN), wrap((req, res) => res.json(svc.runDraw(cid(req), req.user))));
+  app.post('/api/cycles/:id/draw/manual', auth(ADMIN), wrap((req, res) => res.json(svc.manualDraw(cid(req), req.body || {}, req.user))));
+  app.put('/api/cycles/:id', auth(ADMIN), wrap((req, res) => res.json(svc.updateCycle(cid(req), req.body || {}, req.user))));
   app.post('/api/cycles/:id/draw/confirm', auth(ADMIN), wrap((req, res) => res.json(svc.confirmDraw(cid(req), req.user))));
   app.post('/api/cycles/:id/draw/override', auth(ADMIN), wrap((req, res) => res.json(svc.overrideDraw(cid(req), req.body, req.user))));
   app.get('/api/cycles/:id/draw/verify', auth(), wrap((req, res) => res.json(svc.verifyDraw(cid(req)))));

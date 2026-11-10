@@ -183,7 +183,7 @@ class Service {
       if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(start)) throw bad('start_month must be YYYY-MM');
       const cfg = this.config();
       const size = this.eligibleMembers().length;
-      const c = this.s.insert('Cycles', { cycle_number: num, start_month: start, end_month: addMonths(start, Math.max(size, 1) - 1), status: 'draft', group_size: size, amount: Number(cfg.contribution_amount), current_month: 0, created_by: actor.id, created_at: now() });
+      const c = this.s.insert('Cycles', { cycle_number: num, start_month: start, end_month: addMonths(start, Math.max(size, 1) - 1), status: 'draft', group_size: size, amount: Number(cfg.contribution_amount), current_month: 0, draw_method: '', mode: 'full', created_by: actor.id, created_at: now() });
       this.audit(actor, 'cycle.create', 'Cycles', c.id, `Created Cycle ${num}`, null, this.publicCycle(c));
       return this.publicCycle(c);
     });
@@ -214,12 +214,66 @@ class Service {
       const assignments = members.map((m, i) => ({ member_id: m.id, position: positions[i] }));
       const hash = Service.drawHash(c.cycle_number, assignments, salt);
       for (const a of assignments) this.s.insert('DrawResults', { cycle_id: cycleId, member_id: a.member_id, position: a.position, original_position: a.position, drawn_at: ts, proof_hash: sha(`${hash}|${a.member_id}|${a.position}`) });
-      const upd = this.s.update('Cycles', cycleId, { status: 'drawn', draw_hash: hash, draw_salt: salt, group_size: members.length, end_month: addMonths(c.start_month, members.length - 1), amount: Number(this.config().contribution_amount) });
+      const upd = this.s.update('Cycles', cycleId, { status: 'drawn', draw_hash: hash, draw_salt: salt, draw_method: 'random', group_size: members.length, end_month: addMonths(c.start_month, members.length - 1), amount: Number(this.config().contribution_amount) });
       this.audit(actor, wasRedraw ? 'draw.redraw' : 'draw.generate', 'Cycles', cycleId, `${wasRedraw ? 'Re-drew' : 'Drew'} Cycle ${c.cycle_number}; commitment ${hash.slice(0, 16)}…`, null, { draw_hash: hash, drawn_at: ts, members: members.length });
       return this.drawPreview(cycleId, upd);
     });
   }
   _deleteRow(t, id) { const i = this.s.t[t].findIndex(r => r.id === id); this.s.t[t].splice(i, 1); this.s._touch(t); }
+  // ---- order entered by the treasurer when the draw was held outside the system ----
+  updateCycle(id, d, actor) {
+    return this.s.transaction(() => {
+      const c = this.cycle(id);
+      if (c.status !== 'draft' && c.status !== 'drawn') throw new ConflictError('Settings can only be changed before the draw is locked');
+      const patch = {};
+      if (d.start_month !== undefined) {
+        if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(d.start_month)) throw bad('start_month must be YYYY-MM');
+        patch.start_month = d.start_month; patch.end_month = addMonths(d.start_month, Math.max(c.group_size, 1) - 1);
+      }
+      if (d.mode !== undefined) { if (!['full', 'order_only'].includes(d.mode)) throw bad('Invalid mode'); patch.mode = d.mode; }
+      const upd = this.s.update('Cycles', id, patch);
+      this.audit(actor, 'cycle.update', 'Cycles', id, `Updated Cycle ${c.cycle_number} settings`, { start_month: c.start_month, mode: c.mode }, { start_month: upd.start_month, mode: upd.mode });
+      return this.publicCycle(upd);
+    });
+  }
+  manualDraw(cycleId, d, actor) {
+    const note = String(d.note || '').trim();
+    if (note.length < 5) throw bad('Say where and when the draw was held (min 5 characters)');
+    const list = Array.isArray(d.assignments) ? d.assignments : [];
+    return this.s.transaction(() => {
+      const c = this.cycle(cycleId);
+      if (c.status !== 'draft' && c.status !== 'drawn') throw new ConflictError('The draw is already locked for this cycle');
+      const members = this.eligibleMembers();
+      if (members.length < 2) throw bad('At least 2 active participating members are needed');
+      const n = members.length;
+      const byMember = new Map();
+      for (const a of list) {
+        const mid = Number(a.member_id), pos = Number(a.position);
+        if (!members.some(m => m.id === mid)) throw bad(`Member #${a.member_id} is not an active participant`);
+        if (!Number.isInteger(pos) || pos < 1 || pos > n) throw bad(`Positions must be whole numbers from 1 to ${n}`);
+        if (byMember.has(mid)) throw bad(`${members.find(m => m.id === mid).name} appears twice`);
+        byMember.set(mid, pos);
+      }
+      const missing = members.filter(m => !byMember.has(m.id)).map(m => m.name);
+      if (missing.length) throw bad(`No number entered for: ${missing.join(', ')}`);
+      const seen = new Map();
+      for (const [mid, pos] of byMember) {
+        if (seen.has(pos)) throw bad(`Number ${pos} is given to both ${members.find(m => m.id === seen.get(pos)).name} and ${members.find(m => m.id === mid).name}`);
+        seen.set(pos, mid);
+      }
+      if (d.start_month !== undefined && d.start_month !== c.start_month) this.updateCycle(cycleId, { start_month: d.start_month }, actor);
+      const mode = d.mode === 'full' || d.mode === 'order_only' ? d.mode : 'order_only';
+      for (const r of this.s.find('DrawResults', r => r.cycle_id === cycleId)) this._deleteRow('DrawResults', r.id);
+      const assignments = [...byMember].map(([member_id, position]) => ({ member_id, position }));
+      const salt = crypto.randomBytes(24).toString('hex'), ts = now();
+      const cc = this.cycle(cycleId);
+      const hash = Service.drawHash(cc.cycle_number, assignments, salt);
+      for (const a of assignments) this.s.insert('DrawResults', { cycle_id: cycleId, member_id: a.member_id, position: a.position, original_position: a.position, drawn_at: ts, proof_hash: sha(`${hash}|${a.member_id}|${a.position}`) });
+      const upd = this.s.update('Cycles', cycleId, { status: 'drawn', draw_hash: hash, draw_salt: salt, draw_method: 'manual', mode, group_size: n, end_month: addMonths(cc.start_month, n - 1), amount: Number(this.config().contribution_amount) });
+      this.audit(actor, 'draw.manual', 'Cycles', cycleId, `Order for Cycle ${cc.cycle_number} entered manually: ${note}`, null, { note, mode, assignments });
+      return this.drawPreview(cycleId, upd);
+    });
+  }
   drawResults(cycleId) {
     const c = this.cycle(cycleId);
     return this.s.find('DrawResults', r => r.cycle_id === cycleId).sort((a, b) => a.position - b.position).map(r => {
@@ -236,7 +290,7 @@ class Service {
       const results = this.drawResults(cycleId);
       this.audit(actor, 'draw.confirm', 'Cycles', cycleId, `Locked draw for Cycle ${c.cycle_number}`, null, { draw_hash: c.draw_hash, results: results.map(r => ({ member_id: r.member_id, position: r.position })) });
       const lines = results.map(r => `${r.position}. ${r.name} (${r.payout_month})`).join('; ');
-      this.announce({ title: `Cycle ${c.cycle_number} draw results`, body: `Positions: ${lines}. Verification hash: ${c.draw_hash}`, kind: 'auto' }, actor);
+      this.announce({ title: `Cycle ${c.cycle_number} payout order`, body: `${c.draw_method === 'manual' ? 'Order chosen by the group vote and recorded by the treasurer. ' : ''}Positions: ${lines}. Verification hash: ${c.draw_hash}`, kind: 'auto' }, actor);
       this.notify('draw_published', results.map(r => r.member_id), `Cycle ${c.cycle_number} has started. Your payout position is shown in the app. Draw hash ${c.draw_hash.slice(0, 12)}`, (m) => {
         const r = results.find(x => x.member_id === m); return `Cycle ${c.cycle_number} has started. Your payout is #${r.position} (${r.payout_month}). Draw hash ${c.draw_hash.slice(0, 12)}`;
       });
@@ -278,7 +332,7 @@ class Service {
     const recomputed = Service.drawHash(c.cycle_number, rows.map(r => ({ member_id: r.member_id, position: r.original_position })), c.draw_salt);
     const proofsOk = rows.every(r => r.proof_hash === sha(`${c.draw_hash}|${r.member_id}|${r.original_position}`));
     const unique = new Set(rows.map(r => r.position)).size === rows.length && rows.every(r => r.position >= 1 && r.position <= rows.length);
-    return { valid: recomputed === c.draw_hash && proofsOk && unique, revealed: true, commitment: c.draw_hash, recomputed, proofs_ok: proofsOk, positions_unique: unique, overrides, salt: c.draw_salt };
+    return { valid: recomputed === c.draw_hash && proofsOk && unique, method: c.draw_method || 'random', revealed: true, commitment: c.draw_hash, recomputed, proofs_ok: proofsOk, positions_unique: unique, overrides, salt: c.draw_salt };
   }
   _contributors(cycleId) { return this.s.find('DrawResults', r => r.cycle_id === cycleId).map(r => r.member_id); }
 
@@ -288,6 +342,7 @@ class Service {
     return this.s.transaction(() => {
       const c = this.cycle(Number(d.cycle_id));
       if (c.status !== 'active') throw new ConflictError('Cycle is not running');
+      if (c.mode === 'order_only') throw new ConflictError('This cycle is order-only: contributions and payouts are tracked in the system from the next cycle');
       const memberId = Number(d.member_id);
       if (!this.s.one('DrawResults', r => r.cycle_id === c.id && r.member_id === memberId)) throw bad('Member is not part of this cycle');
       const month = Number(d.month_no || c.current_month);
@@ -322,6 +377,7 @@ class Service {
     return this.s.transaction(() => {
       const c = this.cycle(cycleId);
       if (c.status !== 'active') throw new ConflictError('Cycle is not running');
+      if (c.mode === 'order_only') throw new ConflictError('This cycle is order-only: contributions and payouts are tracked in the system from the next cycle');
       const out = [];
       for (const mid of this._contributors(cycleId)) {
         const ex = this.s.one('Contributions', x => x.cycle_id === cycleId && x.member_id === mid && x.month_no === monthNo);
@@ -357,6 +413,7 @@ class Service {
       }
       const c = this.cycle(Number(d.cycle_id));
       if (c.status !== 'active') throw new ConflictError('Cycle is not running');
+      if (c.mode === 'order_only') throw new ConflictError('This cycle is order-only: contributions and payouts are tracked in the system from the next cycle');
       const month = Number(d.month_no || c.current_month);
       if (this.s.one('Payouts', p => p.cycle_id === c.id && p.month_no === month)) throw new ConflictError(`A payout for month ${month} has already been recorded`);
       if (month !== c.current_month) throw new ConflictError(`Payouts must be recorded in order; the current month is ${c.current_month}`);
@@ -400,6 +457,12 @@ class Service {
     return this.s.transaction(() => {
       const c = this.cycle(cycleId);
       if (c.status !== 'active') throw new ConflictError('Only a running cycle can be closed');
+      if (c.mode === 'order_only') {
+        const up = this.s.update('Cycles', cycleId, { status: 'closed', closed_at: now() });
+        this.audit(actor, 'cycle.close', 'Cycles', cycleId, `Closed Cycle ${c.cycle_number} (order-only)`, { status: 'active' }, { status: 'closed' });
+        this.announce({ title: `Cycle ${c.cycle_number} completed`, body: 'The cycle has ended. The system will track contributions and payouts from the next cycle.', kind: 'auto' }, actor);
+        return { cycle: this.publicCycle(up), reconciliation: null };
+      }
       const n = this.s.count('Payouts', p => p.cycle_id === cycleId);
       if (n < c.group_size) throw new ConflictError(`${c.group_size - n} payout(s) still outstanding`);
       const rec = this.reconcile(cycleId);
@@ -455,6 +518,14 @@ class Service {
     out.order = order.map(r => ({ ...r, paid: payouts.some(p => p.position === r.position), is_current: c.status === 'active' && r.position === c.current_month, is_me: r.member_id === user.id }));
     const mine = order.find(r => r.member_id === user.id);
     out.my = mine ? { position: mine.position, payout_month: mine.payout_month, received: payouts.some(p => p.member_id === user.id), contributions: this.s.find('Contributions', x => x.cycle_id === c.id && x.member_id === user.id).sort((a, b) => a.month_no - b.month_no) } : null;
+    if (c.status === 'active' && c.mode === 'order_only') {
+      const [sy, sm] = c.start_month.split('-').map(Number), t = new Date();
+      const cm = Math.min(Math.max((t.getUTCFullYear() - sy) * 12 + (t.getUTCMonth() + 1 - sm) + 1, 1), c.group_size);
+      const rec = order.find(r => r.position === cm);
+      out.order = out.order.map(o => ({ ...o, paid: false, is_current: o.position === cm }));
+      out.current_month = { order_only: true, month_no: cm, label: monthLabel(addMonths(c.start_month, cm - 1)), recipient: { member_id: rec.member_id, name: rec.name } };
+      return out;
+    }
     if (c.status === 'active' && c.current_month <= c.group_size) {
       const cm = c.current_month;
       const status = this.monthStatus(c.id, cm);

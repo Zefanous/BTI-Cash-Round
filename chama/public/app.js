@@ -153,7 +153,10 @@ views.home = async () => {
     <div style="margin-left:auto">${chip(c.status)}</div></div>`;
   if (!c.revealed) return h + `<div class="glass"><h2>Draw not published yet</h2><p class="mute">${esc(d.pending_message || '')}</p>${c.draw_hash ? `<p class="small mute">Commitment hash (published before reveal):</p><div class="mono small">${esc(c.draw_hash)}</div>` : ''}</div>`;
   const cm = d.current_month;
-  if (cm) {
+  if (cm && cm.order_only) {
+    h += `<div class="glass"><h2>This month: ${esc(cm.label)}</h2><div class="stat"><div><span class="mute small">Receives</span><b>${esc(cm.recipient.name)}</b></div></div>
+      <p class="small mute">Contributions and payouts are tracked in the system from the next cycle. Follow the payout order on the Order tab.</p></div>`;
+  } else if (cm) {
     const pct = Math.round(cm.collected / cm.expected * 100);
     h += `<div class="glass"><h2>This month: ${esc(cm.label)}</h2>
       <div class="stat"><div><span class="mute small">Receives</span><b>${esc(cm.recipient.name)}</b></div><div><span class="mute small">Collected</span><b>${money(cm.collected)}</b></div><div><span class="mute small">Due by</span><b>${esc(cm.due_date)}</b></div></div>
@@ -182,6 +185,7 @@ views.record = async () => {
   const [d, members] = await Promise.all([api('GET', '/dashboard'), api('GET', '/members')]);
   cache.group = d.group;
   const c = d.cycle; const q = queue(); if (c) cache.cycleId = c.id;
+  if (c && c.status === 'active' && d.current_month && d.current_month.order_only) return '<div class="glass"><h2>Record</h2><p class="mute">This cycle is order-only. Contributions and payouts will be recorded in the system from the next cycle.</p></div>';
   if (!c || c.status !== 'active' || !d.current_month) return '<div class="glass"><h2>Record</h2><p class="mute">There is no running cycle. Open the Cycle tab to run the draw.</p></div>';
   const cm = d.current_month;
   const unpaid = cm.members.filter(m => m.status !== 'paid');
@@ -229,6 +233,17 @@ views.cycle = async () => {
       <p class="small mute">${cur.status === 'draft' ? 'Run the random draw. Results stay hidden from members and only a commitment hash is published until you confirm.' : cur.status === 'drawn' ? 'Review the draw, then confirm to lock it and notify everyone. You may redraw until confirmed.' : 'Draw is locked.'}</p>`;
     if (det.commitment) h += `<h3>Commitment hash</h3><div class="mono small">${esc(det.commitment)}</div>`;
     if (det.results.length) h += `<h3>Positions</h3>${det.results.map(r => `<div class="row"><div class="pos">${r.position}</div><div class="grow">${esc(r.name)}<div class="small mute">${esc(r.payout_month)}</div></div></div>`).join('')}`;
+    if (cur.status === 'draft' || cur.status === 'drawn') {
+      const elig = members.filter(m => m.status === 'active' && m.participates);
+      const cur_pos = Object.fromEntries(det.results.map(r => [r.member_id, r.position]));
+      h += `<h3>Draw already held? Enter the order</h3><p class="small mute">Use this when the group chose numbers outside the system. Type the number each member got (1 to ${elig.length}). Number 1 receives in the start month.</p>
+      <div id="mo">${elig.map(m => `<div class="row"><div class="grow">${esc(m.name)}</div><input class="mn" data-m="${m.id}" type="number" min="1" max="${elig.length}" inputmode="numeric" value="${cur_pos[m.id] || ''}" style="width:84px" oninput="checkOrder()"></div>`).join('')}</div>
+      <div id="mo-msg" class="small" style="margin:8px 0"></div>
+      <div class="frm"><div><label for="mo-start">Cycle started in (1st of month)</label><input id="mo-start" type="month" value="${esc(cur.start_month)}"></div>
+      <div><label for="mo-mode">Money tracking</label><select id="mo-mode"><option value="order_only">Order only (track money from next cycle)</option><option value="full">Also track contributions and payouts</option></select></div>
+      <div style="grid-column:1/-1"><label for="mo-note">Where and when was the draw held? (recorded in the audit trail)</label><input id="mo-note" value="Group vote held on ${new Date().toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })}"></div></div>
+      <div class="actions"><button class="btn pri" onclick="saveOrder(${cur.id})">Save order</button></div>`;
+    }
     h += '<div class="actions">';
     if (cur.status === 'draft') h += `<button class="btn pri" onclick="runDraw(${cur.id})">🎲 Run random draw (${cur.group_size} members)</button>`;
     if (cur.status === 'drawn') h += `<button class="btn" onclick="runDraw(${cur.id})">Redraw</button><button class="btn pri" onclick="confirmDraw(${cur.id})">Confirm &amp; lock draw</button>`;
@@ -248,6 +263,19 @@ views.cycle = async () => {
   }
   h += `<div class="glass"><h2>All cycles</h2>${cycles.map(c => `<div class="row"><div class="grow"><b>Cycle ${c.cycle_number}</b><div class="small mute">${esc(c.start_label)} – ${esc(c.end_label)} · ${c.group_size} members · ${money(c.amount)} each</div></div>${chip(c.status)}</div>`).join('')}</div>`;
   return h;
+};
+window.checkOrder = () => {
+  const inputs = [...document.querySelectorAll('.mn')], n = inputs.length, vals = inputs.map(i => i.value).filter(Boolean), msg = $('#mo-msg');
+  const dup = vals.filter((v, i) => vals.indexOf(v) !== i);
+  const bad = vals.filter(v => !(Number(v) >= 1 && Number(v) <= n && Number.isInteger(Number(v))));
+  inputs.forEach(i => { i.style.borderColor = (dup.includes(i.value) || bad.includes(i.value)) && i.value ? 'var(--bad)' : ''; });
+  msg.style.color = dup.length || bad.length ? 'var(--bad)' : 'var(--mute)';
+  msg.textContent = bad.length ? `Numbers must be whole numbers from 1 to ${n}.` : dup.length ? `Number ${dup[0]} is used more than once.` : `${vals.length} of ${n} numbers entered.`;
+};
+window.saveOrder = async id => {
+  const assignments = [...document.querySelectorAll('.mn')].map(i => ({ member_id: Number(i.dataset.m), position: Number(i.value) }));
+  const body = { assignments, note: $('#mo-note').value, start_month: $('#mo-start').value, mode: $('#mo-mode').value };
+  if (await act(() => api('POST', `/cycles/${id}/draw/manual`, body), 'Order saved. Review it, then confirm to lock and notify members.')) render();
 };
 window.runDraw = async id => { if (await act(() => api('POST', `/cycles/${id}/draw`), 'Draw generated – review before confirming')) render(); };
 window.confirmDraw = async id => { if (!confirm('Lock the draw and notify all members? This cannot be redrawn afterwards.')) return; if (await act(() => api('POST', `/cycles/${id}/draw/confirm`), 'Draw locked and members notified')) render(); };
